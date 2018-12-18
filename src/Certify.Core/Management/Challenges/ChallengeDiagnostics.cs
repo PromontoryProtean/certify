@@ -202,14 +202,22 @@ namespace Certify.Core.Management.Challenges
                     }
                     else if (challengeConfig.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_DNS)
                     {
+                        var recordName = $"_acme-challenge-test.{domain}".Replace("*.", "");
+
+                        if (challengeConfig.ChallengeProvider == Certify.Providers.DNS.AcmeDns.DnsProviderAcmeDns.Definition.Id)
+                        {
+                            // use real cname to avoid having to setup different records
+                            recordName = $"_acme-challenge.{domain}".Replace("*.", "");
+                        }
+
                         var simulatedAuthorization = new PendingAuthorization
                         {
                             Challenges = new List<AuthorizationChallengeItem> {
                                      new AuthorizationChallengeItem
                                      {
                                           ChallengeType = SupportedChallengeTypes.CHALLENGE_TYPE_DNS,
-                                            Key=$"_acme-challenge-test.{domain}".Replace("*.", ""),
-                                            Value = GenerateSimulatedKeyAuth()
+                                            Key= recordName,
+                                            Value = GenerateSimulatedDnsAuthValue()
                                      }
                                  }
                         };
@@ -253,15 +261,38 @@ namespace Certify.Core.Management.Challenges
 
             random.NextBytes(simulated_token_data);
 
-            var simulated_token = Convert.ToBase64String(simulated_token_data);
+            var simulated_token = Certify.Management.Util.ToUrlSafeBase64String(simulated_token_data);
 
             var sha256 = System.Security.Cryptography.SHA256.Create();
 
-            byte[] thumbprint_data = sha256.ComputeHash(Encoding.UTF8.GetBytes(simulated_token));
+            var thumbprint_data = sha256.ComputeHash(Encoding.UTF8.GetBytes(simulated_token));
 
-            var thumbprint = BitConverter.ToString(thumbprint_data).Replace("-", "").ToLower();
+            var thumbprint = Certify.Management.Util.ToUrlSafeBase64String(thumbprint_data);
 
             return $"{simulated_token}.{thumbprint}";
+        }
+
+        private string GenerateSimulatedDnsAuthValue()
+        {
+           
+            // create simulated challenge response
+
+            var random = new Random();
+
+            var simulated_token_data = new byte[24]; // generate 192 bits of data
+
+            random.NextBytes(simulated_token_data);
+
+            var simulated_token = Certify.Management.Util.ToUrlSafeBase64String(simulated_token_data);
+
+            var hash = "";
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                var keyAuthzDig = sha.ComputeHash(Encoding.UTF8.GetBytes(simulated_token));
+                hash = Certify.Management.Util.ToUrlSafeBase64String(keyAuthzDig);
+                
+            }
+            return $"{hash}";
         }
 
         public async Task<PendingAuthorization> PerformAutomatedChallengeResponse(ILog log, ICertifiedServer iisManager, ManagedCertificate managedCertificate, PendingAuthorization pendingAuth)
@@ -329,7 +360,7 @@ namespace Certify.Core.Management.Challenges
                 return new ActionResult { IsSuccess = false, Message = msg };
             }
 
-            log.Information("Preparing challenge response for Let's Encrypt server to check at: {uri}", httpChallenge.ResourceUri);
+            log.Information($"Preparing challenge response for Let's Encrypt server to check at: {httpChallenge.ResourceUri} with content {httpChallenge.Value}");
             log.Information("If the challenge response file is not accessible at this exact URL the validation will fail and a certificate will not be issued.");
 
             // get website root path (from challenge config or fallback to deprecated
@@ -404,7 +435,7 @@ namespace Certify.Core.Management.Challenges
 
             // copy challenge response to web folder /.well-known/acme-challenge. Check if it already
             // exists (as in 'configcheck' file) as can cause conflicts.
-            if (!File.Exists(destFile))
+            if (!File.Exists(destFile) || !destFile.EndsWith("configcheck"))
             {
                 try
                 {
@@ -426,7 +457,7 @@ namespace Certify.Core.Management.Challenges
             {
                 if (!destFile.EndsWith("configcheck") && File.Exists(destFile))
                 {
-                    log.Verbose("Challenge Cleanup: Removing {file}", destFile);
+                    log.Debug("Challenge Cleanup: Removing {file}", destFile);
                     try
                     {
                         File.Delete(destFile);

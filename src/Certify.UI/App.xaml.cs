@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Windows;
+using Serilog;
 
 namespace Certify.UI
 {
@@ -8,11 +9,20 @@ namespace Certify.UI
     /// </summary>
     public partial class App : Application
     {
+
         protected Certify.UI.ViewModel.AppViewModel MainViewModel
         {
             get
             {
                 return UI.ViewModel.AppViewModel.Current;
+            }
+        }
+
+        protected Models.Providers.ILog Log
+        {
+            get
+            {
+                return MainViewModel.Log;
             }
         }
 
@@ -37,18 +47,23 @@ namespace Certify.UI
             //Certify.Properties.Settings.Default.UpgradeSettingsVersion(); // deprecated
             //Certify.Management.SettingsManager.LoadAppSettings();
 
-            AppDomain currentDomain = AppDomain.CurrentDomain;
+            var currentDomain = AppDomain.CurrentDomain;
             currentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
             base.OnStartup(e);
+
+            Log?.Information("UI Startup");
         }
 
         private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
+          
             var feedbackMsg = "";
             if (e.ExceptionObject != null)
             {
                 feedbackMsg = "An error occurred: " + ((Exception)e.ExceptionObject).ToString();
+
+                Log?.Error(feedbackMsg);
             }
 
             var d = new Windows.Feedback(feedbackMsg, isException: true);

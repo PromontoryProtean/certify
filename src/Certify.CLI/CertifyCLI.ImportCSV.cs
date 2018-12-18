@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Certify.Models;
+using Certify.Shared.Utils;
 
 namespace Certify.CLI
 {
@@ -12,6 +13,7 @@ namespace Certify.CLI
         public async Task ImportCSV(string[] args)
         {
             InitPlugins();
+
             if (!IsRegistered())
             {
                 Console.WriteLine("Import is only available in the registered version of this application.");

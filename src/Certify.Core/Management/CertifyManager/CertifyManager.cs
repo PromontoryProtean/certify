@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -27,6 +28,8 @@ namespace Certify.Management
         private TelemetryClient _tc = null;
         private bool _isRenewAllInProgress { get; set; }
         private ILog _serviceLog { get; set; }
+        private Serilog.Core.LoggingLevelSwitch _loggingLevelSwitch { get; set; }
+
         private bool _httpChallengeServerAvailable = false;
         private ConcurrentDictionary<string, SimpleAuthorizationChallengeItem> _currentChallenges = new ConcurrentDictionary<string, SimpleAuthorizationChallengeItem>();
 
@@ -36,13 +39,11 @@ namespace Certify.Management
 
         public CertifyManager()
         {
-            _serviceLog = new Loggy(
-                new LoggerConfiguration()
-               .MinimumLevel.Verbose()
-               .WriteTo.Debug()
-               .WriteTo.File(Util.GetAppDataFolder("logs") + "\\sessionlog.txt", shared: true, flushToDiskInterval: new TimeSpan(0, 0, 10))
-               .CreateLogger()
-               );
+            var serverConfig = SharedUtils.ServiceConfigManager.GetAppServiceConfig();
+
+            SettingsManager.LoadAppSettings();
+
+            InitLogging(serverConfig);
 
             Util.SetSupportedTLSVersions();
 
@@ -54,8 +55,11 @@ namespace Certify.Management
             _pluginManager = new PluginManager();
             _pluginManager.LoadPlugins();
 
-            // TODO: convert providers to plugins
-            var certes = new Certify.Providers.Certes.CertesACMEProvider(Management.Util.GetAppDataFolder() + "\\certes");
+            // TODO: convert providers to plugins, allow for async init
+            string userAgent = Util.GetUserAgent();
+            var certes = new Certify.Providers.Certes.CertesACMEProvider(Management.Util.GetAppDataFolder() + "\\certes", userAgent);
+
+            certes.InitProvider(_serviceLog).Wait();
 
             _acmeClientProvider = certes;
             _vaultProvider = certes;
@@ -68,17 +72,51 @@ namespace Certify.Management
                 _tc = new Util().InitTelemetry();
             }
 
-            PerformUpgrades();
-
-            var serverConfig = Util.GetAppServiceConfig();
             _httpChallengePort = serverConfig.HttpChallengeServerPort;
             _httpChallengeServerClient.Timeout = new TimeSpan(0, 0, 5);
 
             if (_tc != null) _tc.TrackEvent("ServiceStarted");
 
+            _serviceLog?.Information("Certify Manager Started");
+
+            PerformUpgrades().Wait();
+
         }
 
-        public void PerformUpgrades()
+        private void InitLogging(Shared.ServiceConfig serverConfig)
+        {
+            _loggingLevelSwitch = new Serilog.Core.LoggingLevelSwitch(Serilog.Events.LogEventLevel.Information);
+
+            SetLoggingLevel(serverConfig?.LogLevel);
+
+            _serviceLog = new Loggy(
+                new LoggerConfiguration()
+               .MinimumLevel.ControlledBy(_loggingLevelSwitch)
+               .WriteTo.Debug()
+               .WriteTo.File(Util.GetAppDataFolder("logs") + "\\session.log", shared: true, flushToDiskInterval: new TimeSpan(0, 0, 10))
+               .CreateLogger()
+               );
+
+            _serviceLog?.Information($"Logging started: {_loggingLevelSwitch.MinimumLevel}");
+        }
+
+        public void SetLoggingLevel(string logLevel)
+        {
+            switch (logLevel?.ToLower())
+            {
+                case "debug":
+                    _loggingLevelSwitch.MinimumLevel = Serilog.Events.LogEventLevel.Debug;
+                    break;
+                case "verbose":
+                    _loggingLevelSwitch.MinimumLevel = Serilog.Events.LogEventLevel.Verbose;
+                    break;
+                default:
+                    _loggingLevelSwitch.MinimumLevel = Serilog.Events.LogEventLevel.Information;
+                    break;
+            }
+        }
+
+        public async Task PerformUpgrades()
         {
             // check if there are no registered contacts, if so see if we are upgrading from a vault
             if (GetContactRegistrations().Count == 0)
@@ -89,7 +127,9 @@ namespace Certify.Management
                     string email = acmeVaultMigration.GetContact();
                     if (!String.IsNullOrEmpty(email))
                     {
-                        var addedOK = _acmeClientProvider.AddNewAccountAndAcceptTOS(_serviceLog, email).Result;
+                        var addedOK = await _acmeClientProvider.AddNewAccountAndAcceptTOS(_serviceLog, email);
+
+                        _serviceLog?.Information("Account upgrade completed (vault)");
                     }
                 }
             }
@@ -131,7 +171,7 @@ namespace Certify.Management
                 EventDate = DateTime.UtcNow,
                 LogItemType = LogItemType.GeneralInfo,
                 Message = msg
-            });
+            }, _loggingLevelSwitch);
         }
 
         public RequestProgressState GetRequestProgressState(string managedItemId)
@@ -167,7 +207,7 @@ namespace Certify.Management
 
         public async Task<bool> PerformDailyTasks()
         {
-            Debug.WriteLine("Checking for daily tasks..");
+            _serviceLog?.Information($"Checking for daily tasks..");
 
             // clear old cache of challenge responses
             _currentChallenges = new ConcurrentDictionary<string, SimpleAuthorizationChallengeItem>();
@@ -180,18 +220,61 @@ namespace Certify.Management
             // perform expired cert cleanup (if enabled)
             if (CoreAppSettings.Current.EnableCertificateCleanup)
             {
-                try
-                {
-                    CertificateManager.PerformCertificateStoreCleanup(DateTime.Now);
-                }
-                catch (Exception exp)
-                {
-                    // log exception
-                    _serviceLog.Error("Failed to perform certificate cleanup: " + exp.ToString());
-                }
+                await PerformCertificateCleanup();
+                
             }
 
             return await Task.FromResult(true);
+        }
+
+        public async Task PerformCertificateCleanup()
+        {
+            try
+            {
+                var mode = CoreAppSettings.Current.CertificateCleanupMode;
+                if (mode == null) mode = CertificateCleanupMode.AfterExpiry;
+
+                if (mode != CertificateCleanupMode.None)
+                {
+                    List<string> excludedCertThumprints = new List<string>();
+
+                    if (mode == CertificateCleanupMode.FullCleanup)
+                    {
+                        // excluded thumbprints are all certs currently tracked as managed certs
+                        var managedCerts = await GetManagedCertificates();
+
+                        foreach (var c in managedCerts)
+                        {
+                            if (!string.IsNullOrEmpty(c.CertificateThumbprintHash))
+                            {
+                                excludedCertThumprints.Add(c.CertificateThumbprintHash.ToLower());
+                            }
+                        }
+
+                    }
+
+                    // this will only perform expiry cleanup, as no specific thumbprint provided
+                    var certsRemoved = CertificateManager.PerformCertificateStoreCleanup(
+                            (CertificateCleanupMode)mode,
+                            DateTime.Now,
+                            matchingName: null,
+                            excludedThumbprints: excludedCertThumprints
+                        );
+
+                    if (certsRemoved.Any())
+                    {
+                        foreach (var c in certsRemoved)
+                        {
+                            _serviceLog.Information($"Cleanup removed cert: {c}");
+                        }
+                    }
+                }
+            }
+            catch (Exception exp)
+            {
+                // log exception
+                _serviceLog.Error("Failed to perform certificate cleanup: " + exp.ToString());
+            }
         }
 
         public void Dispose()

@@ -17,7 +17,7 @@ namespace Certify.Core.Management.Challenges
 
         private string _controlKey = "QUIT123";
         private string _checkKey = "TESTING123";
-        private string _challengePrefix = "/.well-known/acme-challenge/";
+        private readonly string _challengePrefix = "/.well-known/acme-challenge/";
 
         private Dictionary<string, string> _challengeResponses { get; set; }
 
@@ -73,10 +73,11 @@ namespace Certify.Core.Management.Challenges
 
                 _httpListener = new HttpListener();
 
-                var serverConfig = Certify.Management.Util.GetAppServiceConfig();
+                var serverConfig = Certify.SharedUtils.ServiceConfigManager.GetAppServiceConfig();
                 _baseUri = $"http://{serverConfig.Host}:{serverConfig.Port}/api/";
 
                 _apiClient = new HttpClient(new HttpClientHandler() { UseDefaultCredentials = true });
+                _apiClient.DefaultRequestHeaders.Add("User-Agent", "Certify/HttpChallengeServer");
                 _apiClient.Timeout = new TimeSpan(0, 0, 5);
 
                 var uriPrefix = $"http://+:{port}{_challengePrefix}";
@@ -91,14 +92,14 @@ namespace Certify.Core.Management.Challenges
 
                 _serverTask = Task.Run(ServerTask);
 
-                var stateTimer = new Timer((Object stateInfo) =>
+                var stateTimer = new Timer((object stateInfo) =>
                 {
                     Log("Checking for auto close.");
                     var time = _lastRequestTime - DateTime.Now;
                     if (Math.Abs(time.TotalSeconds) > 30)
                     {
                         Log("No requests recently, stopping server.");
-                        this.Stop();
+                        Stop();
                     }
                 }, null, 1000 * 10, 1000 * 10);
 
@@ -214,19 +215,26 @@ namespace Certify.Core.Management.Challenges
                                 stream.Close();
                             }
 
-                            if (_debugMode) Log("Challenge Reponse Served OK.");
+                            Log($"Responded with Key: {key} Value:{value}");
+                            
                         }
                         else
                         {
                             server.Response.StatusCode = (int)HttpStatusCode.NotFound;
+
+                            Log($"Requested key not found: {key}");
                         }
+
+                       
                     }
                     else
                     {
                         server.Response.StatusCode = 404;
                     }
                 }
+
                 server.Response.Close();
+
                 if (_debugMode) Log("End request.");
 
                 if (_maxServiceLookups == 0)

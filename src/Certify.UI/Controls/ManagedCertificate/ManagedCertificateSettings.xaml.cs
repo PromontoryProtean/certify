@@ -1,10 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using Certify.Locales;
 using Certify.Models;
+using Certify.Shared.Utils;
 using MahApps.Metro.Controls;
 
 namespace Certify.UI.Controls.ManagedCertificate
@@ -17,6 +19,14 @@ namespace Certify.UI.Controls.ManagedCertificate
         protected Certify.UI.ViewModel.AppViewModel AppViewModel => UI.ViewModel.AppViewModel.Current;
 
         protected Certify.UI.ViewModel.ManagedCertificateViewModel ItemViewModel => UI.ViewModel.ManagedCertificateViewModel.Current;
+
+        protected Models.Providers.ILog Log
+        {
+            get
+            {
+                return AppViewModel.Log;
+            }
+        }
 
         public ManagedCertificateSettings()
         {
@@ -106,24 +116,15 @@ namespace Certify.UI.Controls.ManagedCertificate
                 item.Name = ItemViewModel.PrimarySubjectDomain.Domain;
             }
 
-            // certificates cannot include requests for 'localhost'
-            if (ItemViewModel.SelectedItem.DomainOptions.Any(d => d.IsSelected && d.Domain.StartsWith("*."))
-               &&
-                item.RequestConfig.Challenges.Any(c => c.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_HTTP)
-               )
-            {
-                // if we still can't decide on the primary domain ask user to define it
-                MessageBox.Show("Wildcard domains cannot use http-01 validation for domain authorization. Use dns-01 instead.", SR.SaveError, MessageBoxButton.OK, MessageBoxImage.Error);
-                return false;
-            }
 
-            // certificates cannot request wildcards and use http validation (dns only)
-            if (ItemViewModel.SelectedItem.DomainOptions.Any(d => d.IsSelected && d.Domain.StartsWith("*."))
+            // certificates cannot request wildcards unless they also use DNS validation
+            if (
+                item.DomainOptions.Any(d => d.IsSelected && d.Domain.StartsWith("*."))
                 &&
-                 item.RequestConfig.Challenges.Any(c => c.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_HTTP)
+                !item.RequestConfig.Challenges.Any(c => c.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_DNS)
                 )
             {
-                // if we still can't decide on the primary domain ask user to define it
+
                 MessageBox.Show("Wildcard domains cannot use http-01 validation for domain authorization. Use dns-01 instead.", SR.SaveError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return false;
             }
@@ -141,7 +142,7 @@ namespace Certify.UI.Controls.ManagedCertificate
                 return false;
             }
 
-            if (item.RequestConfig.Challenges.Count(c=>string.IsNullOrEmpty(c.DomainMatch))>1)
+            if (item.RequestConfig.Challenges.Count(c => string.IsNullOrEmpty(c.DomainMatch)) > 1)
             {
                 MessageBox.Show("Only one authorization configuration can be used match any domain (domain match blank). Specify domain(s) to match or remove additional configuration. ", SR.SaveError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return false;
@@ -162,6 +163,15 @@ namespace Certify.UI.Controls.ManagedCertificate
                         }
                     }
                 }
+            }
+
+            // check certificate will not exceed 100 name limit
+            var numSelectedDomains = item.DomainOptions.Count(d => d.IsSelected);
+
+            if (numSelectedDomains > 100)
+            {
+                MessageBox.Show($"Certificates cannot include more than 100 names. You will need to remove names or split your certificate into 2 or more managed certificates.", SR.SaveError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return false;
             }
 
             if (item.RequestConfig.PerformAutomatedCertBinding)
@@ -255,16 +265,26 @@ namespace Certify.UI.Controls.ManagedCertificate
         {
             if (ItemViewModel.SelectedItem != null)
             {
-                if (ItemViewModel.SelectedItem.IsChanged)
-                {
+                
                     var savedOK = await ValidateAndSave(ItemViewModel.SelectedItem);
                     if (!savedOK) return;
-                }
+                
 
                 //begin request
                 AppViewModel.MainUITabIndex = (int)MainWindow.PrimaryUITabs.CurrentProgress;
 
-                await AppViewModel.BeginCertificateRequest(ItemViewModel.SelectedItem.Id);
+                var result = await AppViewModel.BeginCertificateRequest(ItemViewModel.SelectedItem.Id);
+                if (result != null)
+                {
+                    if (result.IsSuccess == false && result.Result is Exception)
+                    {
+                        var msg = ((Exception)result.Result)?.ToString();
+                        Log?.Error($"RequestCertificate: {msg}");
+
+                        // problem communicating or completing the request
+                        MessageBox.Show($"A problem occurred completing this request. Please refer to the log file for more details. \r\n {msg}");
+                    }
+                }
 
                 ItemViewModel.RaisePropertyChangedEvent(nameof(ItemViewModel.SelectedItemLogEntries));
             }
@@ -299,8 +319,8 @@ namespace Certify.UI.Controls.ManagedCertificate
 
             // validate and save before test
             if (!await ValidateAndSave(ItemViewModel.SelectedItem)) return;
-           
-           
+
+
 
             var challengeConfig = ItemViewModel.SelectedItem.GetChallengeConfig(null);
 

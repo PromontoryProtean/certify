@@ -9,16 +9,13 @@ using System.Threading.Tasks;
 using Certify.Locales;
 using Certify.Models;
 using Certify.Models.Config;
-using Certify.Shared;
 using Microsoft.ApplicationInsights;
 using Microsoft.Win32;
-using Newtonsoft.Json;
 
 namespace Certify.Management
 {
     public class Util
     {
-        public const string APPDATASUBFOLDER = "Certify";
 
         /// <summary>
         /// check for problems which could affect app use
@@ -28,15 +25,15 @@ namespace Certify.Management
         {
             var results = new List<ActionResult>();
 
-            string tempPath = "";
-            string tempFolder = Path.GetTempPath();
+            var tempPath = "";
+            var tempFolder = Path.GetTempPath();
 
             // attempt to create a 1MB temp file, detect if it fails
             try
             {
                 tempPath = Path.GetTempFileName();
 
-                FileStream fs = new FileStream(tempPath, FileMode.Open);
+                var fs = new FileStream(tempPath, FileMode.Open);
                 fs.Seek(1024 * 1024, SeekOrigin.Begin);
                 fs.WriteByte(0);
                 fs.Close();
@@ -48,6 +45,30 @@ namespace Certify.Management
             {
                 results.Add(new ActionResult { IsSuccess = false, Message = $"Could not create a temp file ({tempPath}). Windows has a limit of 65535 files in the temp folder ({tempFolder}). Clear temp files  before proceeding. {exp.Message}" });
             }
+
+            // check free disk space
+            try
+            {
+                var cDrive = new DriveInfo("c");
+                if (cDrive.IsReady)
+                {
+                    var freeSpaceBytes = cDrive.AvailableFreeSpace;
+
+                    // Check disk has at least 128MB free
+                    if (freeSpaceBytes < (1024L * 1024 * 128))
+                    {
+                        results.Add(new ActionResult { IsSuccess = false, Message = $"Drive C: has less than 128MB of disk space free. The application may not run correctly." });
+                    }
+                    else
+                    {
+                        results.Add(new ActionResult { IsSuccess = true, Message = $"Drive C: has more than 128MB of disk space free." });
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                results.Add(new ActionResult { IsSuccess = false, Message = $"Could not check how much disk space is left on drive C:" });
+            }
             return Task.FromResult(results);
         }
 
@@ -58,85 +79,7 @@ namespace Certify.Management
 
         public static string GetAppDataFolder(string subFolder = null)
         {
-            var parts = new List<string>()
-            {
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                APPDATASUBFOLDER
-            };
-
-            if (subFolder != null) parts.Add(subFolder);
-
-            var path = Path.Combine(parts.ToArray());
-
-            if (!Directory.Exists(path))
-            {
-                Directory.CreateDirectory(path);
-            }
-
-            return path;
-        }
-
-        /// <summary>
-        /// Get default or saved service config settings
-        /// </summary>
-        /// <returns>  </returns>
-        public static ServiceConfig GetAppServiceConfig()
-        {
-            var serviceConfig = new ServiceConfig();
-
-            var appDataPath = GetAppDataFolder();
-            var serviceConfigFile = appDataPath + "\\serviceconfig.json";
-#if DEBUG
-            serviceConfigFile = appDataPath + "\\serviceconfig.debug.json";
-#endif
-            if (File.Exists(serviceConfigFile))
-            {
-                serviceConfig = JsonConvert.DeserializeObject<ServiceConfig>(File.ReadAllText(serviceConfigFile));
-            }
-            return serviceConfig;
-        }
-
-        public static void StoreCurrentAppServiceConfig()
-        {
-            var appDataPath = GetAppDataFolder();
-            var config = GetAppServiceConfig();
-            var serviceConfigFile = appDataPath + "\\serviceconfig.json";
-#if DEBUG
-            serviceConfigFile = appDataPath + "\\serviceconfig.debug.json";
-#endif
-            File.WriteAllText(serviceConfigFile, JsonConvert.SerializeObject(config));
-        }
-
-        /// <summary>
-        /// Stored updated config for app service
-        /// </summary>
-        /// <param name="port">  </param>
-        /// <returns>  </returns>
-        public static bool SetAppServicePort(int port)
-        {
-            var appDataPath = GetAppDataFolder();
-            var serviceConfigFile = appDataPath + "\\serviceconfig.json";
-#if DEBUG
-            serviceConfigFile = appDataPath + "\\serviceconfig.debug.json";
-#endif
-            try
-            {
-                ServiceConfig settings = new ServiceConfig();
-
-                if (File.Exists(serviceConfigFile))
-                {
-                    settings = JsonConvert.DeserializeObject<ServiceConfig>(File.ReadAllText(serviceConfigFile));
-                }
-
-                settings.Port = port;
-
-                File.WriteAllText(serviceConfigFile, JsonConvert.SerializeObject(settings));
-                return true;
-            }
-            catch (Exception)
-            {
-                return false;
-            }
+            return SharedUtils.ServiceConfigManager.GetAppDataFolder(subFolder);
         }
 
         public TelemetryClient InitTelemetry()
@@ -155,10 +98,16 @@ namespace Certify.Management
             return tc;
         }
 
-        public Version GetAppVersion()
+        public static string GetUserAgent()
+        {
+            var versionName = "Certify/" + GetAppVersion().ToString();
+            return $"{versionName} (Windows; {Environment.OSVersion.ToString()}) ";
+        }
+
+        public static Version GetAppVersion()
         {
             // returns the version of Certify.Shared
-            System.Reflection.Assembly assembly = System.Reflection.Assembly.GetExecutingAssembly();
+            var assembly = System.Reflection.Assembly.GetExecutingAssembly();
 
             var v = assembly.GetName().Version;
             return v;
@@ -180,7 +129,9 @@ namespace Certify.Management
             //get app version
             try
             {
-                HttpClient client = new HttpClient();
+                var client = new HttpClient();
+                client.DefaultRequestHeaders.Add("User-Agent", Util.GetUserAgent());
+
                 var response = await client.GetAsync(Models.API.Config.APIBaseURI + "update?version=" + appVersion);
                 if (response.IsSuccessStatusCode)
                 {
@@ -360,6 +311,7 @@ namespace Certify.Management
             if (result.IsNewerVersion)
             {
                 HttpClient client = new HttpClient();
+                client.DefaultRequestHeaders.Add("User-Agent", Util.GetUserAgent());
 
                 //https://github.com/dotnet/corefx/issues/6849
                 var tempFile = Path.Combine(new string[] { pathname, "CertifySSL_" + result.Version.ToString() + "_Setup.tmp" });
@@ -447,7 +399,7 @@ namespace Certify.Management
         {
             const string subkey = @"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full\";
 
-            using (RegistryKey ndpKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32).OpenSubKey(subkey))
+            using (var ndpKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32).OpenSubKey(subkey))
             {
                 if (ndpKey != null && ndpKey.GetValue("Release") != null)
                 {
@@ -473,6 +425,22 @@ namespace Certify.Management
             // This code should never execute. A non-null release key should mean that 4.5 or later
             // is installed.
             return "No 4.5 or later version detected";
+        }
+
+        
+        public static string ToUrlSafeBase64String(byte[] data)
+        {
+            var s = Convert.ToBase64String(data);
+            s = s.Split('=')[0]; // Remove any trailing '='s
+            s = s.Replace('+', '-'); // 62nd char of encoding
+            s = s.Replace('/', '_'); // 63rd char of encoding
+            return s;
+        }
+
+        public static string ToUrlSafeBase64String(string val)
+        {
+            var bytes = System.Text.UTF8Encoding.UTF8.GetBytes(val);
+            return ToUrlSafeBase64String(bytes);
         }
     }
 }

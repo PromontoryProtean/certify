@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Input;
 using Certify.Locales;
 using Microsoft.ApplicationInsights;
+using Serilog;
 
 namespace Certify.UI
 {
@@ -85,7 +86,7 @@ namespace Certify.UI
             }
 
             // check user has registered a contact with LE first
-            if (String.IsNullOrEmpty(_appViewModel.PrimaryContactEmail))
+            if (string.IsNullOrEmpty(_appViewModel.PrimaryContactEmail))
             {
                 EnsureContactRegistered();
                 return;
@@ -146,7 +147,17 @@ namespace Certify.UI
             if (!_appViewModel.IsServiceAvailable)
             {
                 _appViewModel.IsLoading = false;
-                MessageBox.Show("Certify SSL Manager service is not started. Please restart the service. If this problem persists please contact support@certifytheweb.com.");
+
+                var config = _appViewModel.CertifyClient.GetAppServiceConfig();
+                if (!string.IsNullOrEmpty(config.ServiceFaultMsg))
+                {
+                    MessageBox.Show("Certify SSL Manager service not started. "+ config.ServiceFaultMsg);
+                } else
+                {
+                    MessageBox.Show("Certify SSL Manager service not started. Please restart the service. If this problem persists please refer to https://docs.certifytheweb.com/docs/faq.html and if you cannot resolve the problem contact support@certifytheweb.com.");
+                }
+
+                
                 App.Current.Shutdown();
                 return;
             }
@@ -154,12 +165,14 @@ namespace Certify.UI
             var diagnostics = await Management.Util.PerformAppDiagnostics();
             if (diagnostics.Any(d => d.IsSuccess == false))
             {
-                MessageBox.Show(diagnostics.First(d => d.IsSuccess == false).Message);
+                MessageBox.Show(diagnostics.First(d => d.IsSuccess == false).Message, "Warning");
             }
-            //init telemetry if enabled
+
+            // init telemetry if enabled
             InitTelemetry();
 
-            //check version capabilities
+            // setup plugins
+
             _appViewModel.PluginManager = new Management.PluginManager();
 
             _appViewModel.PluginManager.LoadPlugins();

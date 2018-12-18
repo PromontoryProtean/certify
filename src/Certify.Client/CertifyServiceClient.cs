@@ -32,8 +32,6 @@ namespace Certify.Client
     {
         private HttpClient _client;
 
-        #region Status (SignalR)
-
         public event Action<RequestProgressState> OnRequestProgressStateUpdated;
 
         public event Action<ManagedCertificate> OnManagedCertificateUpdated;
@@ -54,14 +52,20 @@ namespace Certify.Client
 
         public CertifyServiceClient()
         {
-            var serviceConfig = Certify.Management.Util.GetAppServiceConfig();
+            var serviceConfig = Certify.SharedUtils.ServiceConfigManager.GetAppServiceConfig();
 
             _baseUri = $"http://{serviceConfig.Host}:{serviceConfig.Port}" + _baseUri;
             _statusHubUri = $"http://{serviceConfig.Host}:{serviceConfig.Port}" + _statusHubUri;
 
             // use windows authentication
             _client = new HttpClient(new HttpClientHandler() { UseDefaultCredentials = true });
+            _client.DefaultRequestHeaders.Add("User-Agent", "Certify/App");
             _client.Timeout = new TimeSpan(0, 20, 0); // 20 min timeout on service api calls
+        }
+
+        public Shared.ServiceConfig GetAppServiceConfig()
+        {
+            return Certify.SharedUtils.ServiceConfigManager.GetAppServiceConfig();
         }
 
         public async Task ConnectStatusStreamAsync()
@@ -80,8 +84,6 @@ namespace Certify.Client
 
             await connection.Start();
         }
-
-        #endregion Status (SignalR)
 
         private async Task<string> FetchAsync(string endpoint)
         {
@@ -279,8 +281,19 @@ namespace Certify.Client
 
         public async Task<CertificateRequestResult> BeginCertificateRequest(string managedItemId, bool resumePaused)
         {
-            var response = await FetchAsync($"managedcertificates/renewcert/{managedItemId}/{resumePaused}");
-            return JsonConvert.DeserializeObject<CertificateRequestResult>(response);
+            try
+            {
+                var response = await FetchAsync($"managedcertificates/renewcert/{managedItemId}/{resumePaused}");
+                return JsonConvert.DeserializeObject<CertificateRequestResult>(response);
+            }
+            catch (Exception exp) {
+                return new CertificateRequestResult
+                {
+                    IsSuccess = false,
+                    Message = exp.ToString(),
+                    Result = exp
+                };
+            }
         }
 
         public async Task<RequestProgressState> CheckCertificateRequest(string managedItemId)

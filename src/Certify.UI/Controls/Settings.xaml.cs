@@ -35,6 +35,12 @@ namespace Certify.UI.Controls
             //TODO: we could now bind to Preferences
             _prefs = await MainViewModel.CertifyClient.GetPreferences();
 
+            if (_prefs.UseBackgroundServiceAutoRenewal)
+            {
+                // if scheduled task not in use, remove legacy option to modify
+                ConfigureAutoRenew.Visibility = Visibility.Collapsed;
+            }
+
             MainViewModel.PrimaryContactEmail = await MainViewModel.CertifyClient.GetPrimaryContact();
 
             this.EnableTelematicsCheckbox.IsChecked = _prefs.EnableAppTelematics;
@@ -46,7 +52,24 @@ namespace Certify.UI.Controls
 
             this.EnableDNSValidationChecks.IsChecked = _prefs.EnableDNSValidationChecks;
             this.EnableHttpChallengeServer.IsChecked = _prefs.EnableHttpChallengeServer;
-            this.EnableCertificateCleanup.IsChecked = _prefs.EnableCertificateCleanup;
+
+            if (_prefs.CertificateCleanupMode == Models.CertificateCleanupMode.None)
+            {
+                this.CertCleanup_None.IsChecked = true;
+            }
+            else if (_prefs.CertificateCleanupMode == Models.CertificateCleanupMode.AfterExpiry)
+            {
+                this.CertCleanup_AfterExpiry.IsChecked = true;
+            }
+            else if (_prefs.CertificateCleanupMode == Models.CertificateCleanupMode.AfterRenewal)
+            {
+                this.CertCleanup_AfterRenewal.IsChecked = true;
+            }
+            else if (_prefs.CertificateCleanupMode == Models.CertificateCleanupMode.FullCleanup)
+            {
+                this.CertCleanup_FullCleanup.IsChecked = true;
+            }
+
             this.EnableStatusReporting.IsChecked = _prefs.EnableStatusReporting;
 
             this.RenewalIntervalDays.Value = _prefs.RenewalIntervalDays;
@@ -55,7 +78,6 @@ namespace Certify.UI.Controls
             this.DataContext = MainViewModel;
 
             settingsInitialised = true;
-            Save.IsEnabled = false;
 
             //load stored credentials list
             await MainViewModel.RefreshStoredCredentialsList();
@@ -80,7 +102,7 @@ namespace Certify.UI.Controls
             d.ShowDialog();
         }
 
-        private void SettingsUpdated(object sender, RoutedEventArgs e)
+        private async void SettingsUpdated(object sender, RoutedEventArgs e)
         {
             if (settingsInitialised)
             {
@@ -89,7 +111,7 @@ namespace Certify.UI.Controls
                 _prefs.EnableValidationProxyAPI = (this.EnableProxyAPICheckbox.IsChecked == true);
                 _prefs.EnableDNSValidationChecks = (this.EnableDNSValidationChecks.IsChecked == true);
                 _prefs.EnableHttpChallengeServer = (this.EnableHttpChallengeServer.IsChecked == true);
-                _prefs.EnableCertificateCleanup = (this.EnableCertificateCleanup.IsChecked == true);
+
                 _prefs.EnableStatusReporting = (this.EnableStatusReporting.IsChecked == true);
 
                 _prefs.EnableEFS = (this.EnableEFS.IsChecked == true);
@@ -104,7 +126,32 @@ namespace Certify.UI.Controls
                 if (this.RenewalMaxRequests.Value == null) this.RenewalMaxRequests.Value = 0;
                 if (this.RenewalMaxRequests.Value > 100) this.RenewalMaxRequests.Value = 100;
                 _prefs.MaxRenewalRequests = (int)this.RenewalMaxRequests.Value;
-                Save.IsEnabled = true;
+
+                // cert cleanup mode
+                if (this.CertCleanup_None.IsChecked == true)
+                {
+                    _prefs.CertificateCleanupMode = Models.CertificateCleanupMode.None;
+                    _prefs.EnableCertificateCleanup = false;
+                }
+                else if (this.CertCleanup_AfterExpiry.IsChecked == true)
+                {
+                    _prefs.CertificateCleanupMode = Models.CertificateCleanupMode.AfterExpiry;
+                    _prefs.EnableCertificateCleanup = true;
+                }
+                else if (this.CertCleanup_AfterRenewal.IsChecked == true)
+                {
+                    _prefs.CertificateCleanupMode = Models.CertificateCleanupMode.AfterRenewal;
+                    _prefs.EnableCertificateCleanup = true;
+                } else if (this.CertCleanup_FullCleanup.IsChecked == true)
+                {
+                    _prefs.CertificateCleanupMode = Models.CertificateCleanupMode.FullCleanup;
+                    _prefs.EnableCertificateCleanup = true;
+                }
+
+
+                // save settings
+                await MainViewModel.CertifyClient.SetPreferences(_prefs);
+                
             }
         }
 
@@ -122,12 +169,6 @@ namespace Certify.UI.Controls
         {
             // reload settings
             await LoadCurrentSettings();
-        }
-
-        private void Save_Click(object sender, RoutedEventArgs e)
-        {
-            MainViewModel.CertifyClient.SetPreferences(_prefs);
-            Save.IsEnabled = false;
         }
 
         private void AddStoredCredential_Click(object sender, RoutedEventArgs e)

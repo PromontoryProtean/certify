@@ -1,7 +1,7 @@
-using Certify.Management;
-using System;
+﻿using System;
 using System.Windows;
 using System.Windows.Input;
+using Certify.Management;
 
 namespace Certify.UI.Windows
 {
@@ -10,6 +10,14 @@ namespace Certify.UI.Windows
     /// </summary>
     public partial class Registration
     {
+        protected Models.Providers.ILog Log
+        {
+            get
+            {
+                return ViewModel.AppViewModel.Current.Log;
+            }
+        }
+
         public Registration()
         {
             InitializeComponent();
@@ -49,7 +57,7 @@ namespace Certify.UI.Windows
                         var instance = new Models.Shared.RegisteredInstance
                         {
                             InstanceId = ViewModel.AppViewModel.Current.Preferences.InstanceId,
-                            AppVersion = new Management.Util().GetAppVersion().ToString()
+                            AppVersion = Management.Util.GetAppVersion().ToString()
                         };
 
                         var installRegistration = await licensingManager.RegisterInstall(productTypeId, email, key, instance);
@@ -77,14 +85,18 @@ namespace Certify.UI.Windows
                         MessageBox.Show(validationResult.ValidationMessage);
                     }
                 }
-                catch (Exception)
+                catch (Exception exp)
                 {
+
+                    Log?.Information("ValidateKey:" + exp.ToString());
+
                     MessageBox.Show(Certify.Locales.SR.Registration_KeyValidationError);
+                    MessageBox.Show(exp.ToString());
                 }
             }
             else
             {
-                MessageBox.Show(Certify.Locales.SR.Registration_UnableToVerify);
+                MessageBox.Show("Could not load the licensing validation plugin. The app may need to be re-installed.");
             }
 
             ValidateKey.IsEnabled = true;

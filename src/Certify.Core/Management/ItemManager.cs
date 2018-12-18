@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data.SQLite;
 using System.Diagnostics;
@@ -19,13 +20,21 @@ namespace Certify.Management
     {
         public const string ITEMMANAGERCONFIG = "manageditems";
 
-        private Dictionary<string, ManagedCertificate> _managedCertificatesCache { get; set; }
+        private ConcurrentDictionary<string, ManagedCertificate> _managedCertificatesCache { get; set; }
         public string StorageSubfolder = ""; //if specified will be appended to AppData path as subfolder to load/save to
         public bool IsSingleInstanceMode { get; set; } = true; //if true, access to this resource is centralised so we can make assumptions about when reload of settings is required etc
 
+        // TODO: make db path configurable on service start
+        private string _dbPath=$"C:\\programdata\\certify\\{ITEMMANAGERCONFIG}.db";
+        private string _connectionString = "";
+
         public ItemManager()
         {
-            _managedCertificatesCache = new Dictionary<string, ManagedCertificate>();
+            _managedCertificatesCache = new ConcurrentDictionary<string, ManagedCertificate>();
+
+            _dbPath = GetDbPath();
+
+            _connectionString = $"Data Source={_dbPath};PRAGMA temp_store=MEMORY;";
         }
 
         private string GetDbPath()
@@ -41,12 +50,10 @@ namespace Certify.Management
         {
             var watch = Stopwatch.StartNew();
 
-            var path = GetDbPath();
-
             //create database if it doesn't exist
-            if (!File.Exists(path))
+            if (!File.Exists(_dbPath))
             {
-                using (var db = new SQLiteConnection($"Data Source={path}"))
+                using (var db = new SQLiteConnection(_connectionString))
                 {
                     await db.OpenAsync();
                     using (var cmd = new SQLiteCommand("CREATE TABLE manageditem (id TEXT NOT NULL UNIQUE PRIMARY KEY, parentid TEXT NULL, json TEXT NOT NULL)", db))
@@ -57,11 +64,11 @@ namespace Certify.Management
             }
             else
             {
-                await UpgradeSchema(path);
+                await UpgradeSchema();
             }
 
             // save all new/modified items into settings database
-            using (var db = new SQLiteConnection($"Data Source={path}"))
+            using (var db = new SQLiteConnection(_connectionString))
             {
                 await db.OpenAsync();
                 using (var tran = db.BeginTransaction())
@@ -73,8 +80,9 @@ namespace Certify.Management
                             cmd.Parameters.Add(new SQLiteParameter("@id", deleted.Id));
                             await cmd.ExecuteNonQueryAsync();
                         }
-                        _managedCertificatesCache.Remove(deleted.Id);
+                        _managedCertificatesCache.TryRemove(deleted.Id, out var val);
                     }
+
                     foreach (var changed in _managedCertificatesCache.Values.Where(s => s.IsChanged))
                     {
                         using (var cmd = new SQLiteCommand("INSERT OR REPLACE INTO manageditem (id,parentid,json) VALUES (@id,@parentid, @json)", db))
@@ -90,14 +98,13 @@ namespace Certify.Management
                 }
             }
 
-            // reset IsChanged as all items have been persisted
             Debug.WriteLine($"StoreSettings[SQLite] took {watch.ElapsedMilliseconds}ms for {_managedCertificatesCache.Count} records");
         }
 
-        private async Task UpgradeSchema(string path)
+        private async Task UpgradeSchema()
         {
             // attempt column upgrades
-            using (var db = new SQLiteConnection($"Data Source={path}"))
+            using (var db = new SQLiteConnection(_connectionString))
             {
                 await db.OpenAsync();
                 try
@@ -130,13 +137,12 @@ namespace Certify.Management
             await UpgradeSettings();
 
             var watch = Stopwatch.StartNew();
-            // FIXME: this method should be async and called only when absolutely required, these
-            // files can be hundreds of megabytes
-            var path = GetDbPath();
-            if (File.Exists(path))
+            
+            // FIXME: this query should called only when absolutely required as the result set may be very large
+            if (File.Exists(_dbPath))
             {
                 var managedCertificates = new List<ManagedCertificate>();
-                using (var db = new SQLiteConnection($"Data Source={path}"))
+                using (var db = new SQLiteConnection(_connectionString))
                 using (var cmd = new SQLiteCommand("SELECT id, json FROM manageditem", db))
                 {
                     await db.OpenAsync();
@@ -158,17 +164,24 @@ namespace Certify.Management
 
                             managedCertificates.Add(managedCertificate);
                         }
+                        reader.Close();
                     }
                 }
 
-                foreach (var site in managedCertificates) site.IsChanged = false;
 
-                _managedCertificatesCache = managedCertificates.ToDictionary(s => s.Id); ;
+                _managedCertificatesCache.Clear();
+
+                foreach (var site in managedCertificates) {
+                    site.IsChanged = false;
+                    _managedCertificatesCache.AddOrUpdate(site.Id, site, (key, oldValue) => site);
+                }
+
             }
             else
             {
-                _managedCertificatesCache = new Dictionary<string, ManagedCertificate>();
+                _managedCertificatesCache.Clear();
             }
+
             Debug.WriteLine($"LoadSettings[SQLite] took {watch.ElapsedMilliseconds}ms for {_managedCertificatesCache.Count} records");
         }
 
@@ -200,7 +213,14 @@ namespace Certify.Management
                         }
                     }
 
-                    _managedCertificatesCache = managedCertificateList.ToDictionary(s => s.Id);
+                    // update cache
+                    _managedCertificatesCache.Clear();
+
+                    foreach (var site in managedCertificateList)
+                    {
+                        site.IsChanged = false;
+                        _managedCertificatesCache.AddOrUpdate(site.Id, site, (key, oldValue) => site);
+                    }
                 }
 
                 await StoreSettings(); // upgrade to SQLite db storage
@@ -218,7 +238,7 @@ namespace Certify.Management
                 else
                 {
                     // apply schema upgrades
-                    await UpgradeSchema(db);
+                    await UpgradeSchema();
                 }
             }
         }
@@ -227,20 +247,22 @@ namespace Certify.Management
         {
             ManagedCertificate managedCertificate = null;
 
-            using (var db = new SQLiteConnection($"Data Source={GetDbPath()}"))
+            using (var db = new SQLiteConnection(_connectionString))
             using (var cmd = new SQLiteCommand("SELECT json FROM manageditem WHERE id=@id", db))
             {
                 cmd.Parameters.Add(new SQLiteParameter("@id", siteId));
 
-                db.Open();
+                await db.OpenAsync();
                 using (var reader = await cmd.ExecuteReaderAsync())
                 {
                     if (await reader.ReadAsync())
                     {
                         managedCertificate = JsonConvert.DeserializeObject<ManagedCertificate>((string)reader["json"]);
                         managedCertificate.IsChanged = false;
-                        _managedCertificatesCache[managedCertificate.Id] = managedCertificate;
+
+                        _managedCertificatesCache.AddOrUpdate(managedCertificate.Id, managedCertificate, (key, oldValue) => managedCertificate);
                     }
+                    reader.Close();
                 }
             }
 
@@ -297,17 +319,17 @@ namespace Certify.Management
 
             if (managedCertificate.Id == null) managedCertificate.Id = Guid.NewGuid().ToString();
 
-            if (_managedCertificatesCache == null) _managedCertificatesCache = new Dictionary<string, ManagedCertificate>();
+            if (_managedCertificatesCache == null) _managedCertificatesCache = new ConcurrentDictionary<string, ManagedCertificate>();
 
-            _managedCertificatesCache[managedCertificate.Id] = managedCertificate;
+            _managedCertificatesCache.AddOrUpdate(managedCertificate.Id, managedCertificate, (key, oldValue) => managedCertificate);
 
             if (saveAfterUpdate)
             {
-                if (!System.IO.File.Exists(GetDbPath())) await UpgradeSettings();
+                if (!System.IO.File.Exists(_dbPath)) await UpgradeSettings();
 
-                using (var db = new SQLiteConnection($"Data Source={GetDbPath()}"))
+                using (var db = new SQLiteConnection(_connectionString))
                 {
-                    db.Open();
+                    await db.OpenAsync();
                     using (var tran = db.BeginTransaction())
                     {
                         using (var cmd = new SQLiteCommand("INSERT OR REPLACE INTO manageditem (id, parentid, json) VALUES (@id,@parentid,@json)", db))
@@ -328,9 +350,9 @@ namespace Certify.Management
         public async Task DeleteManagedCertificate(ManagedCertificate site)
         {
             // save modified items into settings database
-            using (var db = new SQLiteConnection($"Data Source={GetDbPath()}"))
+            using (var db = new SQLiteConnection(_connectionString))
             {
-                db.Open();
+                await db.OpenAsync();
                 using (var tran = db.BeginTransaction())
                 {
                     using (var cmd = new SQLiteCommand("DELETE FROM manageditem WHERE id=@id", db))
@@ -340,7 +362,7 @@ namespace Certify.Management
                     }
                     tran.Commit();
                     Debug.WriteLine($"DeleteManagedCertificate: Completed {site.Id}");
-                    _managedCertificatesCache.Remove(site.Id);
+                    _managedCertificatesCache.TryRemove(site.Id, out var val);
                 }
             }
         }

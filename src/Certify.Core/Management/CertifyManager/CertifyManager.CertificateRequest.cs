@@ -9,6 +9,7 @@ using Certify.Locales;
 using Certify.Models;
 using Certify.Models.Plugins;
 using Certify.Models.Providers;
+using Certify.Shared.Utils;
 
 namespace Certify.Management
 {
@@ -27,6 +28,8 @@ namespace Certify.Management
                 Debug.WriteLine("Renew all is already is progress..");
                 return await Task.FromResult(new List<CertificateRequestResult>());
             }
+
+            _serviceLog?.Information($"Performing Renew All for all applicable managed certificates.");
 
             _isRenewAllInProgress = true;
             //currently the vault won't let us run parallel requests due to file locks
@@ -247,9 +250,11 @@ namespace Certify.Management
         /// <returns>  </returns>
         public async Task<CertificateRequestResult> PerformCertificateRequest(ILog log, ManagedCertificate managedCertificate, IProgress<RequestProgressState> progress = null, bool resumePaused = false)
         {
+            _serviceLog?.Information($"Performing Certificate Request: {managedCertificate.Name}");
+
             // Perform pre-request checks and scripting hooks, invoke main request process, then
             // perform an post request scripting hooks
-            if (log == null) log = ManagedCertificateLog.GetLogger(managedCertificate.Id);
+            if (log == null) log = ManagedCertificateLog.GetLogger(managedCertificate.Id, _loggingLevelSwitch);
 
             //enable or disable EFS flag on private key certs based on preference
             if (CoreAppSettings.Current.EnableEFS)
@@ -263,6 +268,7 @@ namespace Certify.Management
             var config = managedCertificate.RequestConfig;
             try
             {
+
                 // run pre-request script, if set
                 if (!string.IsNullOrEmpty(config.PreRequestPowerShellScript))
                 {
@@ -312,15 +318,24 @@ namespace Certify.Management
                 // overall exception thrown during process
 
                 result.IsSuccess = false;
-                result.Message = string.Format(Certify.Locales.CoreSR.CertifyManager_RequestFailed, managedCertificate.Name, exp.Message, exp);
+                result.Abort = true;
 
-                LogMessage(managedCertificate.Id, result.Message, LogItemType.CertficateRequestFailed);
+                try
+                {
+                    // attempt to log error
 
-                ReportProgress(progress, new RequestProgressState(RequestState.Error, result.Message, managedCertificate));
+                    log?.Error(exp, $"Certificate request process failed: {exp}");
 
-                await UpdateManagedCertificateStatus(managedCertificate, RequestState.Error, result.Message);
+                    result.Message = string.Format(Certify.Locales.CoreSR.CertifyManager_RequestFailed, managedCertificate.Name, exp.Message, exp);
 
-                log.Error(exp, $"Certificate request process failed: {exp}");
+                    LogMessage(managedCertificate.Id, result.Message, LogItemType.CertficateRequestFailed);
+
+                    ReportProgress(progress, new RequestProgressState(RequestState.Error, result.Message, managedCertificate));
+
+                    await UpdateManagedCertificateStatus(managedCertificate, RequestState.Error, result.Message);
+
+                }
+                catch { }
             }
             finally
             {
@@ -388,6 +403,7 @@ namespace Certify.Management
         private async Task PerformCertificateRequestProcessing(ILog log, ManagedCertificate managedCertificate, IProgress<RequestProgressState> progress, CertificateRequestResult result, CertRequestConfig config)
         {
             //primary domain and each subject alternative name must now be registered as an identifier with LE and validated
+            LogMessage(managedCertificate.Id, $"{Util.GetUserAgent()}");
 
             LogMessage(managedCertificate.Id, $"Beginning Certificate Request Process: {managedCertificate.Name} using ACME Provider:{_acmeClientProvider.GetProviderName()}");
 
@@ -705,10 +721,13 @@ namespace Certify.Management
 
                     var pfxPath = certRequestResult.Result.ToString();
 
+                    string certCleanupName = "";
                     // update managed site summary
                     try
                     {
                         var certInfo = CertificateManager.LoadCertificate(pfxPath);
+
+                        certCleanupName = certInfo.FriendlyName.Substring(0, certInfo.FriendlyName.IndexOf("]") + 1);
                         managedCertificate.DateStart = certInfo.NotBefore;
                         managedCertificate.DateExpiry = certInfo.NotAfter;
                         managedCertificate.DateRenewed = DateTime.Now;
@@ -745,10 +764,6 @@ namespace Certify.Management
                                 isPreviewOnly: false
                             );
 
-                        // var actions = await
-                        // _serverProvider.InstallCertForRequest(managedCertificate, pfxPath,
-                        // cleanupCertStore: true, isPreviewOnly: false);
-
                         if (!actions.Any(a => a.HasError))
                         {
                             //all done
@@ -764,6 +779,48 @@ namespace Certify.Management
                             result.Message = "Request completed";
                             ReportProgress(progress,
                                 new RequestProgressState(RequestState.Success, result.Message, managedCertificate));
+
+                            // perform cert cleanup (if enabled)
+                            if (CoreAppSettings.Current.EnableCertificateCleanup && !string.IsNullOrEmpty(managedCertificate.CertificateThumbprintHash))
+                            {
+                                try
+                                {
+                                    var mode = CoreAppSettings.Current.CertificateCleanupMode;
+
+                                    // default to After Expiry cleanup if no preference specified
+                                    if (mode == null)
+                                    {
+                                        mode = CertificateCleanupMode.AfterExpiry;
+                                    }
+                                    
+                                    // if pref is for full cleanup, use After Renewal just for this renewal cleanup
+                                    if (mode == CertificateCleanupMode.FullCleanup)
+                                    {
+                                        mode = CertificateCleanupMode.AfterRenewal;
+                                    }
+
+                                    // cleanup certs based on the given cleanup mode
+                                    var certsRemoved = CertificateManager.PerformCertificateStoreCleanup(
+                                        (CertificateCleanupMode)mode,
+                                        DateTime.Now,
+                                        matchingName: certCleanupName,
+                                        excludedThumbprints: new List<string> { managedCertificate.CertificateThumbprintHash });
+
+                                    if (certsRemoved.Any())
+                                    {
+                                        foreach (var c in certsRemoved)
+                                        {
+                                            _serviceLog.Information($"Cleanup removed cert: {c}");
+                                        }
+                                    }
+
+                                }
+                                catch (Exception exp)
+                                {
+                                    // log exception
+                                    _serviceLog.Error("Failed to perform certificate cleanup: " + exp.ToString());
+                                }
+                            }
                         }
                         else
                         {
@@ -844,6 +901,8 @@ namespace Certify.Management
                         else
                         {
                             _httpChallengeServerAvailable = await StartHttpChallengeServer();
+
+                            if (_tc != null) _tc.TrackEvent("ChallengeResponse_HttpChallengeServer_Start");
                         }
 
                         if (_httpChallengeServerAvailable)
@@ -853,6 +912,8 @@ namespace Certify.Management
                         else
                         {
                             LogMessage(managedCertificate.Id, $"Http Challenge Server process unavailable.", LogItemType.CertificateRequestStarted);
+
+                            if (_tc != null) _tc.TrackEvent("ChallengeResponse_HttpChallengeServer_Unavailable");
                         }
                     }
                 }
@@ -892,6 +953,10 @@ namespace Certify.Management
                                     Value = rc.Value
                                 });
                         }
+
+                        var providerDesc = challengeConfig.ChallengeProvider != null ? challengeConfig.ChallengeProvider : challengeConfig.ChallengeType;
+
+                        if (_tc != null) _tc.TrackEvent($"PerformChallengeResponse_{providerDesc}");
 
                         // ask LE to check our answer to their authorization challenge (http-01 or
                         // tls-sni-01), LE will then attempt to fetch our answer, if all accessible
@@ -986,6 +1051,8 @@ namespace Certify.Management
                 logPrefix = "[Preview Mode] ";
             }
 
+            _serviceLog?.Information($"{(isPreviewOnly ? "Previewing" : "Performing")} Certificate Deployment: {managedCertificate.Name}");
+
             var result = new CertificateRequestResult { ManagedItem = managedCertificate, IsSuccess = false, Message = "" };
             var config = managedCertificate.RequestConfig;
             var pfxPath = managedCertificate.CertificatePath;
@@ -1032,6 +1099,10 @@ namespace Certify.Management
 
         public async Task<StatusMessage> RevokeCertificate(ILog log, ManagedCertificate managedCertificate)
         {
+            _serviceLog?.Information($"Performing Certificate Revoke: {managedCertificate.Name}");
+
+            if (log == null) log = ManagedCertificateLog.GetLogger(managedCertificate.Id, _loggingLevelSwitch);
+
             if (_tc != null) _tc.TrackEvent("RevokeCertificate");
 
             var result = await _acmeClientProvider.RevokeCertificate(log, managedCertificate);
