@@ -21,7 +21,7 @@ namespace Certify.Core.Management.Challenges
 
         private Dictionary<string, string> _challengeResponses { get; set; }
 
-        private int _maxServiceLookups = 100;
+        private int _maxServiceLookups = 1000;
         private string _baseUri = "";
 
 #if DEBUG
@@ -72,13 +72,13 @@ namespace Certify.Core.Management.Challenges
                 if (checkKey != null) _checkKey = checkKey;
 
                 _httpListener = new HttpListener();
-
+                
                 var serverConfig = Certify.SharedUtils.ServiceConfigManager.GetAppServiceConfig();
                 _baseUri = $"http://{serverConfig.Host}:{serverConfig.Port}/api/";
 
                 _apiClient = new HttpClient(new HttpClientHandler() { UseDefaultCredentials = true });
                 _apiClient.DefaultRequestHeaders.Add("User-Agent", "Certify/HttpChallengeServer");
-                _apiClient.Timeout = new TimeSpan(0, 0, 5);
+                _apiClient.Timeout = new TimeSpan(0, 0, 20);
 
                 var uriPrefix = $"http://+:{port}{_challengePrefix}";
                 _httpListener.Prefixes.Add(uriPrefix);
@@ -109,7 +109,13 @@ namespace Certify.Core.Management.Challenges
             {
                 //could not start listener, port may be in use
                 System.Diagnostics.Debug.WriteLine($"Http Challenge server error: {exp}");
-                _httpListener.Stop();
+                try
+                {
+                    // try to stop the listener, if a collision on port etc then listener will already be disposed
+                    _httpListener.Stop();
+                }
+                catch { }
+
                 _httpListener.Close();
                 _httpListener = null;
 
@@ -124,6 +130,8 @@ namespace Certify.Core.Management.Challenges
 
         private async Task ServerTask()
         {
+            string serverHeader = "Http-Challenge-Server-Certify/";
+
             while (_httpListener != null && _httpListener.IsListening)
             {
                 _lastRequestTime = DateTime.Now;
@@ -133,6 +141,8 @@ namespace Certify.Core.Management.Challenges
                 var path = server.Request.Url.LocalPath;
 
                 if (_debugMode) Log(path);
+
+                server.Response.Headers.Add("Server", serverHeader);
 
                 var key = path.Replace(_challengePrefix, "").ToLower();
 

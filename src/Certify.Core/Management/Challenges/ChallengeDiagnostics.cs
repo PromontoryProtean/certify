@@ -85,7 +85,7 @@ namespace Certify.Core.Management.Challenges
                 // if DNS checks enabled, attempt them here
                 if (isPreviewMode && enableDnsChecks)
                 {
-                    bool includeIPResolution = false;
+                    var includeIPResolution = false;
                     if (managedCertificate.RequestConfig.Challenges.Any(c => c.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_HTTP))
                     {
                         includeIPResolution = true;
@@ -121,7 +121,14 @@ namespace Certify.Core.Management.Challenges
                 {
                     var challengeConfig = managedCertificate.GetChallengeConfig(domain);
 
-                    if (challengeConfig.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_HTTP)
+                    var challengeType = challengeConfig.ChallengeType;
+                    if (challengeType== SupportedChallengeTypes.CHALLENGE_TYPE_SNI)
+                    {
+                        log.Warning("tls-sni-01 challenge type is no longer supported by the Let's Encrypt service. Falling back to http-01");
+                        challengeType = SupportedChallengeTypes.CHALLENGE_TYPE_HTTP;
+                    }
+
+                    if (challengeType == SupportedChallengeTypes.CHALLENGE_TYPE_HTTP)
                     {
                         // if dns validation not selected but one or more domains is a wildcard, reject
                         if (domain.StartsWith("*."))
@@ -166,8 +173,16 @@ namespace Certify.Core.Management.Challenges
                             results.Add(new StatusMessage { IsOK = true, Message = httpChallengeResult.Message, Result = httpChallengeResult });
                         }
                     }
-                    else if (challengeConfig.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_SNI)
+                    else if (challengeType == SupportedChallengeTypes.CHALLENGE_TYPE_SNI)
                     {
+                       
+                            result.IsOK = false;
+                            result.FailedItemSummary.Add($"The {SupportedChallengeTypes.CHALLENGE_TYPE_SNI} challenge type is no longer available.");
+                            results.Add(result);
+
+                            return results;
+                        /*
+
                         var serverVersion = await serverManager.GetServerVersion();
 
                         if (serverVersion.Major < 8)
@@ -199,8 +214,9 @@ namespace Certify.Core.Management.Challenges
                             )();
 
                         results.Add(result);
+                        */
                     }
-                    else if (challengeConfig.ChallengeType == SupportedChallengeTypes.CHALLENGE_TYPE_DNS)
+                    else if (challengeType == SupportedChallengeTypes.CHALLENGE_TYPE_DNS)
                     {
                         var recordName = $"_acme-challenge-test.{domain}".Replace("*.", "");
 
@@ -403,7 +419,7 @@ namespace Certify.Core.Management.Challenges
 
             log.Information("Using website path {path}", websiteRootPath);
 
-            if (String.IsNullOrEmpty(websiteRootPath) || !Directory.Exists(websiteRootPath))
+            if (string.IsNullOrEmpty(websiteRootPath) || !Directory.Exists(websiteRootPath))
             {
                 // our website no longer appears to exist on disk, continuing would potentially
                 // create unwanted folders, so it's time for us to give up
@@ -507,7 +523,7 @@ namespace Certify.Core.Management.Challenges
                         }
                         catch (Exception exp)
                         {
-                            this.LogAction($"Failed to write config: " + exp.Message);
+                            LogAction($"Failed to write config: " + exp.Message);
                         }
 
                         if (await _netUtil.CheckURL(log, httpChallenge.ResourceUri))
@@ -553,7 +569,7 @@ namespace Certify.Core.Management.Challenges
             // compute n sha256 hashes, where n=challengedata.iterationcount
             z[0] = sha256.ComputeHash(Encoding.UTF8.GetBytes(tlsSniChallenge.Value));
 
-            for (int i = 1; i < z.Length; i++)
+            for (var i = 1; i < z.Length; i++)
             {
                 z[i] = sha256.ComputeHash(z[i - 1]);
             }
@@ -563,7 +579,7 @@ namespace Certify.Core.Management.Challenges
 
             var checkQueue = new List<Func<bool>>();
 
-            foreach (string hex in z.Select(b =>
+            foreach (var hex in z.Select(b =>
                 BitConverter.ToString(b).Replace("-", "").ToLower()))
             {
                 var sni = $"{hex.Substring(0, 32)}.{hex.Substring(32)}.acme.invalid";
@@ -636,7 +652,7 @@ namespace Certify.Core.Management.Challenges
             // configure cleanup actions for use after challenge completes
             pendingAuth.Cleanup = async () =>
                {
-                   var result = await dnsHelper.DeleteDNSChallenge(log, managedCertificate, domain, dnsChallenge.Key);
+                   var result = await dnsHelper.DeleteDNSChallenge(log, managedCertificate, domain, dnsChallenge.Key, dnsChallenge.Value);
                    //log.Information(result.Result?.Message);
                };
 

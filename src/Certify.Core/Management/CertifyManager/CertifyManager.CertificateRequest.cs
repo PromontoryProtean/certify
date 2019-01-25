@@ -16,6 +16,11 @@ namespace Certify.Management
     public partial class CertifyManager
     {
         /// <summary>
+        /// The maximum number of certificate requests which will be attempted in a batch (Renew All)
+        /// </summary>
+        const int MAX_CERTIFICATE_REQUEST_TASKS = 50;
+
+        /// <summary>
         /// Perform Renew All: identify all items to renew then initiate renewal process
         /// </summary>
         /// <param name="autoRenewalOnly">  </param>
@@ -32,9 +37,9 @@ namespace Certify.Management
             _serviceLog?.Information($"Performing Renew All for all applicable managed certificates.");
 
             _isRenewAllInProgress = true;
-            //currently the vault won't let us run parallel requests due to file locks
-            var performRequestsInParallel = false;
 
+            // we can perform request in parallel but if processing many requests this can cause issues committing IIS bindings etc
+            var performRequestsInParallel = false;
             var testModeOnly = false;
 
             IEnumerable<ManagedCertificate> managedCertificates = await _itemManager.GetManagedCertificates(
@@ -86,7 +91,7 @@ namespace Certify.Management
 
                 //if we care about stopped sites being stopped, check for that if a specifc site is selected
                 var isSiteRunning = true;
-                if (!CoreAppSettings.Current.IgnoreStoppedSites && !String.IsNullOrEmpty(managedCertificate.ServerSiteId))
+                if (!CoreAppSettings.Current.IgnoreStoppedSites && !string.IsNullOrEmpty(managedCertificate.ServerSiteId))
                 {
                     isSiteRunning = await IsManagedCertificateRunning(managedCertificate.Id);
                 }
@@ -100,18 +105,34 @@ namespace Certify.Management
                         tracker = progressTrackers[managedCertificate.Id];
                     }
 
-                    // optionally limit the number of renewal tasks to attempt in this pass
-                    if (maxRenewalTasks == 0 || maxRenewalTasks > 0 && numRenewalTasks < maxRenewalTasks)
+                    // limit the number of renewal tasks to attempt in this pass either to custom setting or max allowed
+                    if (
+                        (maxRenewalTasks == 0 && numRenewalTasks < MAX_CERTIFICATE_REQUEST_TASKS)
+                        || (maxRenewalTasks > 0 && numRenewalTasks < maxRenewalTasks && numRenewalTasks < MAX_CERTIFICATE_REQUEST_TASKS))
                     {
                         if (testModeOnly)
                         {
                             //simulated request for UI testing
-                            renewalTasks.Add(this.PerformDummyCertificateRequest(managedCertificate, tracker));
+
+                            renewalTasks.Add(
+                                new Task<CertificateRequestResult>(
+                                () => PerformDummyCertificateRequest(managedCertificate, tracker).Result,
+                                TaskCreationOptions.LongRunning
+                            ));
                         }
                         else
                         {
-                            renewalTasks.Add(this.PerformCertificateRequest(null, managedCertificate, tracker));
+                            renewalTasks.Add(
+                               new Task<CertificateRequestResult>(
+                               () => PerformCertificateRequest(null, managedCertificate, tracker).Result,
+                               TaskCreationOptions.LongRunning
+                           ));
                         }
+                    } else
+                    {
+                        //send progress back to report skip
+                        var progress = (IProgress<RequestProgressState>)progressTrackers[managedCertificate.Id];
+                        ReportProgress(progress, new RequestProgressState(RequestState.NotRunning, "Skipped renewal because the max requests per batch has been reached. This request will be attempted again later.", managedCertificate), true);
                     }
                     numRenewalTasks++;
                 }
@@ -130,7 +151,7 @@ namespace Certify.Management
                     {
                         //TODO: show this as warning rather than success
 
-                        msg = String.Format(CoreSR.CertifyManager_RenewalOnHold, managedCertificate.RenewalFailureCount);
+                        msg = string.Format(CoreSR.CertifyManager_RenewalOnHold, managedCertificate.RenewalFailureCount);
                         logThisEvent = true;
                     }
 
@@ -152,17 +173,25 @@ namespace Certify.Management
 
             if (performRequestsInParallel)
             {
-                var results = await Task.WhenAll(renewalTasks);
+                //var results = await Task.WaitAll(renewalTasks);
+                var results = new List<CertificateRequestResult>();
+                foreach (var t in renewalTasks)
+                {
+                    t.Start();
+                    results.Add(await t);
+                }
 
-                //siteManager.StoreSettings();
                 _isRenewAllInProgress = false;
                 return results.ToList();
             }
             else
             {
                 var results = new List<CertificateRequestResult>();
+
+                // perform all renewal tasks one after the other
                 foreach (var t in renewalTasks)
                 {
+                    t.RunSynchronously();
                     results.Add(await t);
                 }
 
@@ -599,6 +628,7 @@ namespace Certify.Management
                                     {
                                         authorization.AttemptedChallenge = authorization.Challenges.FirstOrDefault(c => c.ChallengeType == challengeConfig.ChallengeType);
                                     }
+
                                     var submissionStatus = await _acmeClientProvider.SubmitChallenge(log, challengeConfig.ChallengeType,
                                     authorization.AttemptedChallenge);
 
@@ -721,7 +751,8 @@ namespace Certify.Management
 
                     var pfxPath = certRequestResult.Result.ToString();
 
-                    string certCleanupName = "";
+                    var certCleanupName = "";
+
                     // update managed site summary
                     try
                     {
@@ -792,7 +823,7 @@ namespace Certify.Management
                                     {
                                         mode = CertificateCleanupMode.AfterExpiry;
                                     }
-                                    
+
                                     // if pref is for full cleanup, use After Renewal just for this renewal cleanup
                                     if (mode == CertificateCleanupMode.FullCleanup)
                                     {
@@ -801,10 +832,12 @@ namespace Certify.Management
 
                                     // cleanup certs based on the given cleanup mode
                                     var certsRemoved = CertificateManager.PerformCertificateStoreCleanup(
-                                        (CertificateCleanupMode)mode,
+                                       (CertificateCleanupMode)mode,
                                         DateTime.Now,
                                         matchingName: certCleanupName,
-                                        excludedThumbprints: new List<string> { managedCertificate.CertificateThumbprintHash });
+                                        excludedThumbprints: new List<string> { managedCertificate.CertificateThumbprintHash },
+                                        log: _serviceLog
+                                    );
 
                                     if (certsRemoved.Any())
                                     {
@@ -825,8 +858,10 @@ namespace Certify.Management
                         else
                         {
                             // we failed to install this cert or create/update the https binding
-                            string msg = string.Join("\r\n", actions.Where(s => s.HasError)
-                               .Select(s => s.Description).ToArray());
+                            var msg = string.Join("\r\n",
+                                actions.Where(s => s.HasError)
+                               .Select(s => s.Description).ToArray()
+                               );
 
                             result.Message = msg;
 
@@ -954,7 +989,7 @@ namespace Certify.Management
                                 });
                         }
 
-                        var providerDesc = challengeConfig.ChallengeProvider != null ? challengeConfig.ChallengeProvider : challengeConfig.ChallengeType;
+                        var providerDesc = challengeConfig.ChallengeProvider ?? challengeConfig.ChallengeType;
 
                         if (_tc != null) _tc.TrackEvent($"PerformChallengeResponse_{providerDesc}");
 
